@@ -5,7 +5,7 @@ var factory = new ConnectionFactory { HostName = "localhost" };
 using var connection = await factory.CreateConnectionAsync();
 using var channel = await connection.CreateChannelAsync();
 
-await channel.QueueDeclareAsync(queue: "hello", durable: true, exclusive: false, autoDelete: false, arguments: null);
+await channel.ExchangeDeclareAsync(exchange: "logs", type: ExchangeType.Fanout);
 
 List<string> messages = GetMessages();
 
@@ -38,11 +38,9 @@ static async void SendMessages(List<string> messages, IChannel channel)
     foreach(var message in messages)
     {
         var body = Encoding.UTF8.GetBytes(message);
-        var props = new BasicProperties
-        {
-            Persistent = true,
-        };
-        await channel.BasicPublishAsync(exchange: string.Empty, routingKey: "hello", mandatory: true, basicProperties: props, body: body);
+        await channel.BasicPublishAsync(exchange: "logs", routingKey: string.Empty, body: body);
         Console.WriteLine(message);
+
+        Thread.Sleep(400);
     }
 }

@@ -8,31 +8,25 @@ var factory = new ConnectionFactory {HostName = "localhost"};
 using var connection = await factory.CreateConnectionAsync();
 using var channel = await connection.CreateChannelAsync();
 
-await channel.QueueDeclareAsync(queue: "hello", durable: true, exclusive: false, autoDelete: false,
-    arguments: null);
+await channel.ExchangeDeclareAsync(exchange: "logs", type: ExchangeType.Fanout);
 
-await channel.BasicQosAsync(prefetchCount: 1, prefetchSize: 0, global: false);
+QueueDeclareOk queueDeclareResult  = await channel.QueueDeclareAsync();
+string queueName = queueDeclareResult.QueueName;
+
+await channel.QueueBindAsync(queue: queueName, exchange: "logs", routingKey: string.Empty);
 
 Console.WriteLine(" [*] Waiting for messages.");
 
 var consumer = new AsyncEventingBasicConsumer(channel);
-consumer.ReceivedAsync += async (model, ea) =>
+consumer.ReceivedAsync += (model, ea) =>
 {
-    var body = ea.Body.ToArray();
+    byte[] body = ea.Body.ToArray();
     var message = Encoding.UTF8.GetString(body);
-    Console.WriteLine("received message: " + message);
-
-    int dots = message.Split('.').Length - 1;
-
-    await Task.Delay(dots * 100);
-
-    await channel.BasicAckAsync(deliveryTag: ea.DeliveryTag, multiple: false);
-
-    count++;
-    Console.WriteLine("done " + count);
+    Console.WriteLine($" [x] {message}");
+    return Task.CompletedTask;
 };
 
-await channel.BasicConsumeAsync("hello", autoAck: false, consumer: consumer);
+await channel.BasicConsumeAsync(queueName, autoAck: true, consumer: consumer);
 
 Console.WriteLine(" Press [enter] to exit.");
 Console.ReadLine();
