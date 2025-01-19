@@ -2,18 +2,31 @@
 using RabbitMQ.Client.Events;
 using System.Text;
 
-int count = 0;
+if (args.Length < 1)
+{
+    Console.Error.WriteLine("Usage: {0} [info] [warning] [error]",
+                            Environment.GetCommandLineArgs()[0]);
+    Console.WriteLine(" Press [enter] to exit.");
+    Console.ReadLine();
+    Environment.ExitCode = 1;
+    return;
+}
+
+int count = 1;
 
 var factory = new ConnectionFactory {HostName = "localhost"};
 using var connection = await factory.CreateConnectionAsync();
 using var channel = await connection.CreateChannelAsync();
 
-await channel.ExchangeDeclareAsync(exchange: "logs", type: ExchangeType.Fanout);
+await channel.ExchangeDeclareAsync(exchange: "direct_logs", type: ExchangeType.Direct);
 
 QueueDeclareOk queueDeclareResult  = await channel.QueueDeclareAsync();
 string queueName = queueDeclareResult.QueueName;
 
-await channel.QueueBindAsync(queue: queueName, exchange: "logs", routingKey: string.Empty);
+foreach (string? severity in args)
+{
+    await channel.QueueBindAsync(queue: queueName, exchange: "direct_logs", routingKey: severity);
+}
 
 Console.WriteLine(" [*] Waiting for messages.");
 
@@ -22,7 +35,8 @@ consumer.ReceivedAsync += (model, ea) =>
 {
     byte[] body = ea.Body.ToArray();
     var message = Encoding.UTF8.GetString(body);
-    Console.WriteLine($" [x] {message}");
+    var routingKey = ea.RoutingKey;
+    Console.WriteLine($" [x] Received '{routingKey}':'{message}' --- '{count++}'");
     return Task.CompletedTask;
 };
 
