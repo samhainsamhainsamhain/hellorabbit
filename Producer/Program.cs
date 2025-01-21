@@ -1,119 +1,292 @@
-﻿using RabbitMQ.Client;
-using RabbitMQ.Client.Events;
-using System.Collections.Concurrent;
+﻿using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Text;
+using RabbitMQ.Client;
 
-public class RpcClient : IAsyncDisposable
+const ushort MAX_OUTSTANDING_CONFIRMS = 256;
+
+const int MESSAGE_COUNT = 50_000;
+bool debug = false;
+
+var channelOpts = new CreateChannelOptions(
+    publisherConfirmationsEnabled: true,
+    publisherConfirmationTrackingEnabled: true,
+    outstandingPublisherConfirmationsRateLimiter: new ThrottlingRateLimiter(MAX_OUTSTANDING_CONFIRMS)
+);
+
+var props = new BasicProperties
 {
-    private const string QUEUE_NAME = "rpc_queue";
+    Persistent = true
+};
 
-    private readonly IConnectionFactory _connectionFactory;
-    private readonly ConcurrentDictionary<string, TaskCompletionSource<string>> _callbackMapper = new();
-
-    private IConnection? _connection;
-    private IChannel? _channel;
-    private string? _replyQueueName;
-
-    public RpcClient()
+string hostname = "localhost";
+if (args.Length > 0)
+{
+    if (false == string.IsNullOrWhiteSpace(args[0]))
     {
-        _connectionFactory = new ConnectionFactory { HostName = "localhost" };
-    }
-
-    public async Task StartAsync()
-    {
-        _connection = await _connectionFactory.CreateConnectionAsync();
-        _channel = await _connection.CreateChannelAsync();
-
-        // declare a server-named queue
-        QueueDeclareOk queueDeclareResult = await _channel.QueueDeclareAsync();
-        _replyQueueName = queueDeclareResult.QueueName;
-        var consumer = new AsyncEventingBasicConsumer(_channel);
-
-        consumer.ReceivedAsync += (model, ea) =>
-        {
-            string? correlationId = ea.BasicProperties.CorrelationId;
-
-            if (false == string.IsNullOrEmpty(correlationId))
-            {
-                if (_callbackMapper.TryRemove(correlationId, out var tcs))
-                {
-                    var body = ea.Body.ToArray();
-                    var response = Encoding.UTF8.GetString(body);
-                    tcs.TrySetResult(response);
-                }
-            }
-
-            return Task.CompletedTask;
-        };
-
-        await _channel.BasicConsumeAsync(_replyQueueName, true, consumer);
-    }
-
-    public async Task<string> CallAsync(string message, CancellationToken cancellationToken = default)
-    {
-        if (_channel is null)
-        {
-            throw new InvalidOperationException();
-        }
-
-        string correlationId = Guid.NewGuid().ToString();
-        var props = new BasicProperties
-        {
-            CorrelationId = correlationId,
-            ReplyTo = _replyQueueName
-        };
-
-        var tcs = new TaskCompletionSource<string>(
-                TaskCreationOptions.RunContinuationsAsynchronously);
-        _callbackMapper.TryAdd(correlationId, tcs);
-
-        var messageBytes = Encoding.UTF8.GetBytes(message);
-        await _channel.BasicPublishAsync(exchange: string.Empty, routingKey: QUEUE_NAME,
-            mandatory: true, basicProperties: props, body: messageBytes);
-
-        using CancellationTokenRegistration ctr =
-            cancellationToken.Register(() =>
-            {
-                _callbackMapper.TryRemove(correlationId, out _);
-                tcs.SetCanceled();
-            });
-
-        return await tcs.Task;
-    }
-
-    public async ValueTask DisposeAsync()
-    {
-        if (_channel is not null)
-        {
-            await _channel.CloseAsync();
-        }
-
-        if (_connection is not null)
-        {
-            await _connection.CloseAsync();
-        }
+        hostname = args[0];
     }
 }
 
-public class Rpc
+#pragma warning disable CS8321 // Local function is declared but never used
+
+await PublishMessagesIndividuallyAsync();
+await PublishMessagesInBatchAsync();
+await HandlePublishConfirmsAsynchronously();
+
+Task<IConnection> CreateConnectionAsync()
 {
-    public static async Task Main(string[] args)
-    {
-        Console.WriteLine("RPC Client");
-        string n = args.Length > 0 ? args[0] : "10"; // 10th number in fibonacci should be equal 55
-        await InvokeAsync(n);
+    var factory = new ConnectionFactory { HostName = hostname };
+    return factory.CreateConnectionAsync();
+}
 
-        Console.WriteLine(" Press [enter] to exit.");
-        Console.ReadLine();
+async Task PublishMessagesIndividuallyAsync()
+{
+    Console.WriteLine($"{DateTime.Now} [INFO] publishing {MESSAGE_COUNT:N0} messages and handling confirms per-message");
+
+    await using IConnection connection = await CreateConnectionAsync();
+    await using IChannel channel = await connection.CreateChannelAsync(channelOpts);
+
+    // declare a server-named queue
+    QueueDeclareOk queueDeclareResult = await channel.QueueDeclareAsync();
+    string queueName = queueDeclareResult.QueueName;
+
+    var sw = new Stopwatch();
+    sw.Start();
+
+    for (int i = 0; i < MESSAGE_COUNT; i++)
+    {
+        byte[] body = Encoding.UTF8.GetBytes(i.ToString());
+        try
+        {
+            await channel.BasicPublishAsync(exchange: string.Empty, routingKey: queueName, body: body, basicProperties: props, mandatory: true);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"{DateTime.Now} [ERROR] saw nack or return, ex: {ex}");
+        }
     }
 
-    private static async Task InvokeAsync(string n)
-    {
-        var rpcClient = new RpcClient();
-        await rpcClient.StartAsync();
+    sw.Stop();
 
-        Console.WriteLine(" [x] Requesting fib({0})", n);
-        var response = await rpcClient.CallAsync(n);
-        Console.WriteLine(" [.] Got '{0}'", response);
+    Console.WriteLine($"{DateTime.Now} [INFO] published {MESSAGE_COUNT:N0} messages individually in {sw.ElapsedMilliseconds:N0} ms");
+}
+
+async Task PublishMessagesInBatchAsync()
+{
+    Console.WriteLine($"{DateTime.Now} [INFO] publishing {MESSAGE_COUNT:N0} messages and handling confirms in batches");
+
+    await using IConnection connection = await CreateConnectionAsync();
+    await using IChannel channel = await connection.CreateChannelAsync(channelOpts);
+
+    // declare a server-named queue
+    QueueDeclareOk queueDeclareResult = await channel.QueueDeclareAsync();
+    string queueName = queueDeclareResult.QueueName;
+
+    int batchSize = MAX_OUTSTANDING_CONFIRMS / 2;
+    int outstandingMessageCount = 0;
+
+    var sw = new Stopwatch();
+    sw.Start();
+
+    var publishTasks = new List<ValueTask>();
+    for (int i = 0; i < MESSAGE_COUNT; i++)
+    {
+        byte[] body = Encoding.UTF8.GetBytes(i.ToString());
+        publishTasks.Add(channel.BasicPublishAsync(exchange: string.Empty, routingKey: queueName, body: body, mandatory: true, basicProperties: props));
+        outstandingMessageCount++;
+
+        if (outstandingMessageCount == batchSize)
+        {
+            foreach (ValueTask pt in publishTasks)
+            {
+                try
+                {
+                    await pt;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"{DateTime.Now} [ERROR] saw nack or return, ex: '{ex}'");
+                }
+            }
+            publishTasks.Clear();
+            outstandingMessageCount = 0;
+        }
     }
+
+    if (publishTasks.Count > 0)
+    {
+        foreach (ValueTask pt in publishTasks)
+        {
+            try
+            {
+                await pt;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"{DateTime.Now} [ERROR] saw nack or return, ex: '{ex}'");
+            }
+        }
+        publishTasks.Clear();
+        outstandingMessageCount = 0;
+    }
+
+    sw.Stop();
+    Console.WriteLine($"{DateTime.Now} [INFO] published {MESSAGE_COUNT:N0} messages in batch in {sw.ElapsedMilliseconds:N0} ms");
+}
+
+async Task HandlePublishConfirmsAsynchronously()
+{
+    Console.WriteLine($"{DateTime.Now} [INFO] publishing {MESSAGE_COUNT:N0} messages and handling confirms asynchronously");
+
+    await using IConnection connection = await CreateConnectionAsync();
+
+    channelOpts = new CreateChannelOptions(publisherConfirmationsEnabled: true, publisherConfirmationTrackingEnabled: false);
+    await using IChannel channel = await connection.CreateChannelAsync(channelOpts);
+
+    // declare a server-named queue
+    QueueDeclareOk queueDeclareResult = await channel.QueueDeclareAsync();
+    string queueName = queueDeclareResult.QueueName;
+
+    var allMessagesConfirmedTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var outstandingConfirms = new LinkedList<ulong>();
+    var semaphore = new SemaphoreSlim(1, 1);
+    int confirmedCount = 0;
+    async Task CleanOutstandingConfirms(ulong deliveryTag, bool multiple)
+    {
+        if (debug)
+        {
+            Console.WriteLine("{0} [DEBUG] confirming message: {1} (multiple: {2})",
+                DateTime.Now, deliveryTag, multiple);
+        }
+
+        await semaphore.WaitAsync();
+        try
+        {
+            if (multiple)
+            {
+                do
+                {
+                    LinkedListNode<ulong>? node = outstandingConfirms.First;
+                    if (node is null)
+                    {
+                        break;
+                    }
+                    if (node.Value <= deliveryTag)
+                    {
+                        outstandingConfirms.RemoveFirst();
+                    }
+                    else
+                    {
+                        break;
+                    }
+
+                    confirmedCount++;
+                } while (true);
+            }
+            else
+            {
+                confirmedCount++;
+                outstandingConfirms.Remove(deliveryTag);
+            }
+        }
+        finally
+        {
+            semaphore.Release();
+        }
+
+        if (outstandingConfirms.Count == 0 || confirmedCount == MESSAGE_COUNT)
+        {
+            allMessagesConfirmedTcs.SetResult(true);
+        }
+    }
+
+    channel.BasicReturnAsync += (sender, ea) =>
+    {
+        ulong sequenceNumber = 0;
+
+        IReadOnlyBasicProperties props = ea.BasicProperties;
+        if (props.Headers is not null)
+        {
+            object? maybeSeqNum = props.Headers[Constants.PublishSequenceNumberHeader];
+            if (maybeSeqNum is not null)
+            {
+                sequenceNumber = BinaryPrimitives.ReadUInt64BigEndian((byte[])maybeSeqNum);
+            }
+        }
+
+        Console.WriteLine($"{DateTime.Now} [WARNING] message sequence number {sequenceNumber} has been basic.return-ed");
+        return CleanOutstandingConfirms(sequenceNumber, false);
+    };
+
+    channel.BasicAcksAsync += (sender, ea) => CleanOutstandingConfirms(ea.DeliveryTag, ea.Multiple);
+    channel.BasicNacksAsync += (sender, ea) =>
+    {
+        Console.WriteLine($"{DateTime.Now} [WARNING] message sequence number: {ea.DeliveryTag} has been nacked (multiple: {ea.Multiple})");
+        return CleanOutstandingConfirms(ea.DeliveryTag, ea.Multiple);
+    };
+
+    var sw = new Stopwatch();
+    sw.Start();
+
+    var publishTasks = new List<ValueTuple<ulong, ValueTask>>();
+    for (int i = 0; i < MESSAGE_COUNT; i++)
+    {
+        string msg = i.ToString();
+        byte[] body = Encoding.UTF8.GetBytes(msg);
+        ulong nextPublishSeqNo = await channel.GetNextPublishSequenceNumberAsync();
+        if ((ulong)(i + 1) != nextPublishSeqNo)
+        {
+            Console.WriteLine($"{DateTime.Now} [WARNING] i {i + 1} does not equal next sequence number: {nextPublishSeqNo}");
+        }
+        await semaphore.WaitAsync();
+        try
+        {
+            outstandingConfirms.AddLast(nextPublishSeqNo);
+        }
+        finally
+        {
+            semaphore.Release();
+        }
+
+        string rk = queueName;
+        if (i % 1000 == 0)
+        {
+            // This will cause a basic.return, for fun
+            rk = Guid.NewGuid().ToString();
+        }
+        (ulong, ValueTask) data =
+            (nextPublishSeqNo, channel.BasicPublishAsync(exchange: string.Empty, routingKey: rk, body: body, mandatory: true, basicProperties: props));
+        publishTasks.Add(data);
+    }
+
+    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+    // await Task.WhenAll(publishTasks).WaitAsync(cts.Token);
+    foreach ((ulong SeqNo, ValueTask PublishTask) datum in publishTasks)
+    {
+        try
+        {
+            await datum.PublishTask;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"{DateTime.Now} [ERROR] saw nack, seqNo: '{datum.SeqNo}', ex: '{ex}'");
+        }
+    }
+
+    try
+    {
+        await allMessagesConfirmedTcs.Task.WaitAsync(cts.Token);
+    }
+    catch (OperationCanceledException)
+    {
+        Console.Error.WriteLine("{0} [ERROR] all messages could not be published and confirmed within 10 seconds", DateTime.Now);
+    }
+    catch (TimeoutException)
+    {
+        Console.Error.WriteLine("{0} [ERROR] all messages could not be published and confirmed within 10 seconds", DateTime.Now);
+    }
+
+    sw.Stop();
+    Console.WriteLine($"{DateTime.Now} [INFO] published {MESSAGE_COUNT:N0} messages and handled confirm asynchronously {sw.ElapsedMilliseconds:N0} ms");
 }
